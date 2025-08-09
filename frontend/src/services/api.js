@@ -18,3 +18,11 @@ export const analyzeImage = (file) => {
     headers: { "Content-Type": "multipart/form-data" },
   });
 };
+
+export const classifyImage = (file) => {
+  const form = new FormData();
+  form.append("file", file);
+  return api.post("/api/classify-image", form, {
+    headers: { "Content-Type": "multipart/form-data" },
+  });
+};

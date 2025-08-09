@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const dicomParser = require('dicom-parser');
+const axios = require('axios');
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -72,6 +74,70 @@ app.post('/api/analyze-image', upload.single('file'), (req, res) => {
     dicom,
     predictions: [{ label: 'normal', confidence: 0.95 }], // stub
   });
+});
+
+// Helper: call HF image-classification model with short retry if model is cold
+async function hfImageClassify(buffer, mime) {
+  const model = process.env.HF_IMAGE_MODEL || 'microsoft/resnet-50';
+  const token = process.env.HF_TOKEN;
+  if (!token) throw new Error('HF_TOKEN not set');
+
+  const url = `https://api-inference.huggingface.co/models/${model}`;
+
+  let attempts = 0;
+  while (attempts < 2) {
+    try {
+      const resp = await axios.post(url, buffer, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': mime || 'application/octet-stream',
+          Accept: 'application/json',
+        },
+        timeout: 20000,
+      });
+      return resp.data;
+    } catch (err) {
+      const status = err.response?.status;
+      const data = err.response?.data;
+      // Model cold-start: 503 with estimated_time
+      if (status === 503 && data?.estimated_time && attempts === 0) {
+        const waitMs = Math.min(4000, data.estimated_time * 1000);
+        await new Promise((r) => setTimeout(r, waitMs));
+        attempts++;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+// POST /api/classify-image — calls Hugging Face image-classification model
+app.post('/api/classify-image', upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+
+  const mime = req.file.mimetype;
+  // Keep classification to raster images for now (DICOM stays on /api/analyze-image)
+  if (!['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(mime)) {
+    return res
+      .status(400)
+      .json({ message: 'Only PNG/JPEG/WEBP supported for classification right now' });
+  }
+
+  try {
+    const out = await hfImageClassify(req.file.buffer, mime);
+    // Expected output: [{label, score}, ...]
+    const predictions = Array.isArray(out)
+      ? out.map(({ label, score }) => ({ label, confidence: score }))
+      : out;
+
+    res.json({
+      model: process.env.HF_IMAGE_MODEL || 'microsoft/resnet-50',
+      predictions,
+    });
+  } catch (e) {
+    const detail = e.response?.data?.error || e.message;
+    res.status(502).json({ message: 'HF call failed', detail });
+  }
 });
 
 app.get('/', (_req, res) => res.send('Backend is running...'));
