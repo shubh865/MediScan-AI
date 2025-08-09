@@ -19,10 +19,20 @@ export const analyzeImage = (file) => {
   });
 };
 
-export const classifyImage = (file) => {
+export const classifyImage = (file, model) => {
   const form = new FormData();
   form.append("file", file);
   return api.post("/api/classify-image", form, {
     headers: { "Content-Type": "multipart/form-data" },
+    params: model ? { model } : undefined,
+  });
+};
+
+export const detectObjects = (file, model) => {
+  const form = new FormData();
+  form.append("file", file);
+  return api.post("/api/detect-objects", form, {
+    headers: { "Content-Type": "multipart/form-data" },
+    params: model ? { model } : undefined,
   });
 };

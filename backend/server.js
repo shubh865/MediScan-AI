@@ -7,6 +7,8 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const DEFAULT_MODEL = process.env.HF_IMAGE_MODEL || 'microsoft/resnet-50';
+const DEFAULT_DET_MODEL = process.env.HF_DET_MODEL || 'facebook/detr-resnet-50';
 
 app.use(cors());
 app.use(express.json());
@@ -23,7 +25,7 @@ const upload = multer({
         'image/jpg',
         'image/webp',
         'application/dicom',
-        'application/octet-stream', // some tools send DICOM as octet-stream
+        'application/octet-stream',
       ].includes(file.mimetype) ||
       (file.originalname || '').toLowerCase().endsWith('.dcm');
 
@@ -36,7 +38,7 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'api-gateway', version: '0.1.0' });
 });
 
-// POST /api/analyze-image — accepts image/DICOM and returns basic info (+ DICOM tags if applicable)
+// ---------- DICOM / stub analyze ----------
 app.post('/api/analyze-image', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
@@ -76,12 +78,10 @@ app.post('/api/analyze-image', upload.single('file'), (req, res) => {
   });
 });
 
-// Helper: call HF image-classification model with short retry if model is cold
-async function hfImageClassify(buffer, mime) {
-  const model = process.env.HF_IMAGE_MODEL || 'microsoft/resnet-50';
+// ---------- HF helpers ----------
+async function callHF(buffer, mime, model) {
   const token = process.env.HF_TOKEN;
   if (!token) throw new Error('HF_TOKEN not set');
-
   const url = `https://api-inference.huggingface.co/models/${model}`;
 
   let attempts = 0;
@@ -99,7 +99,6 @@ async function hfImageClassify(buffer, mime) {
     } catch (err) {
       const status = err.response?.status;
       const data = err.response?.data;
-      // Model cold-start: 503 with estimated_time
       if (status === 503 && data?.estimated_time && attempts === 0) {
         const waitMs = Math.min(4000, data.estimated_time * 1000);
         await new Promise((r) => setTimeout(r, waitMs));
@@ -111,29 +110,61 @@ async function hfImageClassify(buffer, mime) {
   }
 }
 
-// POST /api/classify-image — calls Hugging Face image-classification model
+// ---------- Classification ----------
 app.post('/api/classify-image', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
   const mime = req.file.mimetype;
-  // Keep classification to raster images for now (DICOM stays on /api/analyze-image)
   if (!['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(mime)) {
-    return res
-      .status(400)
-      .json({ message: 'Only PNG/JPEG/WEBP supported for classification right now' });
+    return res.status(400).json({ message: 'Only PNG/JPEG/WEBP supported for classification right now' });
   }
 
-  try {
-    const out = await hfImageClassify(req.file.buffer, mime);
-    // Expected output: [{label, score}, ...]
-    const predictions = Array.isArray(out)
-      ? out.map(({ label, score }) => ({ label, confidence: score }))
-      : out;
+  const model = String(req.query.model || req.headers['x-hf-model'] || DEFAULT_MODEL);
 
-    res.json({
-      model: process.env.HF_IMAGE_MODEL || 'microsoft/resnet-50',
-      predictions,
+  try {
+    const data = await callHF(req.file.buffer, mime, model);
+    const predictions = Array.isArray(data)
+      ? data.map(({ label, score }) => ({ label, confidence: score }))
+      : data;
+
+    res.json({ model, predictions });
+  } catch (e) {
+    const detail = e.response?.data?.error || e.message;
+    res.status(502).json({ message: 'HF call failed', detail });
+  }
+});
+
+// ---------- Object Detection (NEW) ----------
+app.post('/api/detect-objects', upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+
+  const mime = req.file.mimetype;
+  if (!['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(mime)) {
+    return res.status(400).json({ message: 'Only PNG/JPEG/WEBP supported for detection' });
+  }
+
+  const model = String(req.query.model || req.headers['x-hf-model'] || DEFAULT_DET_MODEL);
+
+  try {
+    const data = await callHF(req.file.buffer, mime, model);
+    // Normalize to {label, confidence, box:{xmin,ymin,xmax,ymax}}
+    const detections = (Array.isArray(data) ? data : []).map((d) => {
+      const label = d.label ?? d.class ?? 'object';
+      const confidence = d.score ?? d.confidence ?? 0;
+      const b = d.box || {};
+      let xmin, ymin, xmax, ymax;
+      if (typeof b.xmin === 'number') {
+        ({ xmin, ymin, xmax, ymax } = b);
+      } else if (typeof b.x === 'number') {
+        xmin = b.x;
+        ymin = b.y;
+        xmax = b.x + (b.w || 0);
+        ymax = b.y + (b.h || 0);
+      }
+      return { label, confidence, box: { xmin, ymin, xmax, ymax } };
     });
+
+    res.json({ model, detections });
   } catch (e) {
     const detail = e.response?.data?.error || e.message;
     res.status(502).json({ message: 'HF call failed', detail });
